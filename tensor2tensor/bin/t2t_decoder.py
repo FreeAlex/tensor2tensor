@@ -35,7 +35,7 @@ from __future__ import print_function
 import os
 
 # Dependency imports
-
+import numpy as np
 from tensor2tensor.bin import t2t_trainer
 from tensor2tensor.data_generators import text_encoder
 from tensor2tensor.utils import decoding
@@ -63,6 +63,8 @@ flags.DEFINE_bool("decode_interactive", False,
 flags.DEFINE_integer("decode_shards", 1, "Number of decoding replicas.")
 flags.DEFINE_string("score_file", "", "File to score. Each line in the file "
                     "must be in the format input \t target.")
+flags.DEFINE_string("perplexity_file", "", "File to compute perplexity. Each line in the file "
+                    "must be in the format target.")
 
 
 def create_hparams():
@@ -156,6 +158,66 @@ def score_file(filename):
   return results
 
 
+def get_perplexity(filename):
+  print('computing perplexity for ', filename)
+  """Score each line in a file and return the scores."""
+  # Prepare model.
+  hparams = create_hparams()
+  encoders = registry.problem(FLAGS.problems).feature_encoders(FLAGS.data_dir)
+  has_inputs = "inputs" in encoders
+  assert not has_inputs
+
+  # Prepare features for feeding into the model.
+  if has_inputs:
+    inputs_ph = tf.placeholder(dtype=tf.int32)  # Just length dimension.
+    batch_inputs = tf.reshape(inputs_ph, [1, -1, 1, 1])  # Make it 4D.
+  targets_ph = tf.placeholder(dtype=tf.int32)  # Just length dimension.
+  batch_targets = tf.reshape(targets_ph, [1, -1, 1, 1])  # Make it 4D.
+  features = {
+      "inputs": batch_inputs,
+      "targets": batch_targets,
+  } if has_inputs else {"targets": batch_targets}
+
+  # Prepare the model and the graph when model runs on features.
+  model = registry.model(FLAGS.model)(hparams, tf.estimator.ModeKeys.PREDICT)
+  res = model.infer(features)
+  saver = tf.train.Saver()
+
+  with tf.Session() as sess:
+    # Load weights from checkpoint.
+    ckpts = tf.train.get_checkpoint_state(FLAGS.output_dir)
+    ckpt = ckpts.model_checkpoint_path
+    saver.restore(sess, ckpt)
+    # Run on each line.
+    results = []
+    for line in open(filename):
+      tab_split = line.split("\t")
+      if len(tab_split) > 2:
+        raise ValueError("Each line must have at most one tab separator.")
+      if len(tab_split) == 1:
+        targets = tab_split[0].strip()
+      else:
+        targets = tab_split[1].strip()
+        inputs = tab_split[0].strip()
+      # Run encoders and append EOS symbol.
+      targets_numpy = encoders["targets"].encode(
+          targets) + [text_encoder.EOS_ID]
+      if has_inputs:
+        inputs_numpy = encoders["inputs"].encode(inputs) + [text_encoder.EOS_ID]
+      # Prepare the feed.
+      feed = {
+          inputs_ph: inputs_numpy,
+          targets_ph: targets_numpy
+      } if has_inputs else {targets_ph: targets_numpy}
+      # Get the score.
+      out, logp = sess.run([res['outputs'], res['scores']], feed)
+
+      perplexity = np.exp(-logp/len(out[0]))
+      results.append(perplexity)
+
+  return results
+
+
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
   trainer_lib.set_random_seed(FLAGS.random_seed)
@@ -173,6 +235,20 @@ def main(_):
     for score in results:
       write_file.write("%.6f\n" % score)
     write_file.close()
+    return
+
+  if FLAGS.perplexity_file:
+    filename = os.path.expanduser(FLAGS.perplexity_file)
+    if not tf.gfile.Exists(filename):
+        raise ValueError("The file to compute perplexity doesn't exist: %s" % filename)
+    if not FLAGS.decode_to_file:
+        raise ValueError("To score a file, specify --decode_to_file for results.")
+    results = get_perplexity(filename)
+    write_file = open(os.path.expanduser(FLAGS.decode_to_file), "w")
+    for score in results:
+        write_file.write("%.6f\n" % score)
+    write_file.close()
+    print('Compute perplexity success!')
     return
 
   hp = create_hparams()
